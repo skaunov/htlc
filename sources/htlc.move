@@ -1,189 +1,231 @@
 /// Module: htlc
 /// HTLC implementation compatible with <https://github.com/decred/atomicswap> hence with many more projects which conform to it. 
-/// Basically this enables [Decred Atomic Swaps](https://docs.decred.org/advanced/atomic-swap/) for any `Coin` on Sui 
+/// This enables [Decred Atomic Swaps](https://docs.decred.org/advanced/atomic-swap/) for any `Coin` on Sui 
 /// (with addresses not on deny-list) if somebody would want to implement that.
 /// 
 /// WARNING: It's not possible to check if the hash time locked `Coin` is regulated or its metadata can be altered during the lock-time, 
-/// *so it's duty of the downstream off-chain to check* that the `Coin` isn't regulated, frozen, or if the user takes those 
-/// risk participating in the deal. *Note, that's equaly important at the audit phase of the protocol.*
+/// *so it's the duty of the downstream off-chain to check* that the `Coin` isn't regulated, frozen, or if the user takes those 
+/// risks participating in the deal. *Note, that's equally important at the audit phase of the protocol.*
 /// 
-/// During auditing phase a lot of things should be checked: starting from correct assets, amounts, and addresses, 
+/// During the auditing phase, a lot of things should be checked: starting from correct assets, amounts, and addresses, 
 /// to the fact that counterparty code will actually hash to the agreed value, since there's a risk of a situation when correct 
 /// hashed value is asserted with a different algorithm/settings which leads to exposure of the _secret_ via "mempool" without 
 /// ability to redeem the asset leaving it to be refunded by the counterparty.
 /// 
 /// # tests
 /// After adding some test code it became clear to me that proper tests for this should involve node RPC calls due to the nature of 
-/// the protocol. Hence presented tests are somewhat superficial; and still they're divided in two modules: 
+/// the protocol. Hence presented tests are somewhat superficial; and still they're divided into two modules: 
 /// one adapts test from an Ethereum project and another checks error handling introduced here.
+
 module htlc::htlc {
     use std::hash;
-
     use sui::coin::Coin;
     use sui::clock::{Self, Clock};
-
     use sui::event;
+    use sui::transfer;
+    use sui::object::{Self as object, UID, ID};
+    use sui::tx_context::{Self as tx_context, TxContext};
 
     const ESecretPreimageWrong: u64 = 1;
     const ESecretLengthWrong: u64 = 2;
     const ERefund3rdParty: u64 = 3;
     const ERefundEarly: u64 = 4;
 
-    // `Coin` is essential here a) to be able to transfer it to user accounts, and b) to be able communicate what kind of asset was indeed locked
-    // `Balance` won't be inspectable via a RPC in the same way.
+    // `Coin` is essential here a) to be able to transfer it to user accounts, and b) to be able to communicate what kind of asset was indeed locked
+    // `Balance` won't be inspectable via an RPC in the same way.
     #[allow(lint(coin_field))] 
     /// Representation of the hash time lock itself.
-    // how to prevent from burning the lock (so that refund won't be possible)? should it be shared?
-    /*      design decision: it can be either shared or object-owned (by the module itself); the later entites `store` and everything it needs (incl. fees), 
-    the former requires sequencing, *but* the wrapped `Coin` do requires that anyway, so this requirements comes for free */
-    public struct LockObject<phantom T> has key { // should not have `store` to pin it to the addressant
+    public struct LockObject<phantom T> has key {
         id: UID,
-        /// timestamp of the instance creation
+        /// Timestamp of the instance creation
         created_at: u64,
-        /// timestamp after which `refund` is available
+        /// Timestamp after which `refund` is available
         deadline: u64,
-        /// hashed value of the secret
+        /// Hashed value of the secret
         hashed: vector<u8>,
-        /// refunded `Coin` will be addressed to this
+        /// Address to which the refunded `Coin` will be sent
         refund_adr: address,
-        /// redeemed `Coin` will be addressed to this
+        /// Address to which the redeemed `Coin` will be sent
         target_adr: address,
-        /// address that initiated the lock
+        /// Address that initiated the lock
         initiator: address,
-        /// byte length of the secret
+        /// Byte length of the secret
         secret_length: u8,
-        /// locked `Coin` 
+        /// Locked `Coin` 
         coin: Coin<T>,
-        // hash: string::String // could be cool to have different hash variants, but it's always SHA-2 SHA256 in all implementations around
     }
 
+    /// Event emitted when a new lock is created.
     public struct NewLockEvent has copy, drop {
-        /// `UID` of the lock created
         lock: ID,
-        /// hash guarding the lock
         hash: vector<u8>,
-        /// `Coin` that was locked
         coin: ID,
-        /// refund address
         refund_adr: address,
-        /// redeem address
         target_adr: address,
-        /// address that created the lock
         initiator: address,
-        /// timestamp after which `refund` is available
         deadline: u64,
-        /// duration used to lock the `Coin`
         duration: u64,
-        /// byte length of the secret
         secret_length: u8,
     }
+
+    /// Event emitted when a lock is redeemed.
     public struct LockClaimedEvent has copy, drop {
-        /// `UID` of the lock redeemed
         lock: ID,
-        /// unlock secret
         secret: vector<u8>,
-        /// address initiated the claim
-        claimer: address
+        claimer: address,
     }
+
+    /// Event emitted when a lock is refunded.
     public struct LockRefundedEvent has copy, drop {
-        /// `UID` of the lock refunded
         lock: ID,
-        /// address initiated the refund
-        signer_: address,
+        signer: address,
     }
 
     /// Creates a new hash time lock.
-    /// Doesn't `assert` hash length since it should be done by the counterparty anyway.
+    /// - Parameters:
+    ///   - `clock`: Reference to the Clock object to get the current timestamp.
+    ///   - `dur`: Duration for which the coin will be locked (in milliseconds).
+    ///   - `hashed`: Hashed value of the secret.
+    ///   - `target`: Address to which the coin will be transferred upon redemption.
+    ///   - `refund`: Address to which the coin will be refunded.
+    ///   - `amount`: The coin being locked.
+    ///   - `secret_length`: Length of the secret in bytes.
+    ///   - `ctx`: Transaction context.
+    /// - Emits:
+    ///   - `NewLockEvent` with details of the created lock.
     public fun create_lock_object<T>(
         clock: &Clock,
         dur: u64,
-        hashed: vector<u8>, target: address, refund: address, amount: Coin<T>,
+        hashed: vector<u8>, 
+        target: address, 
+        refund: address, 
+        amount: Coin<T>,
         secret_length: u8,
         ctx: &mut TxContext
     ) {
         let timestamp = clock::timestamp_ms(clock);
-        let lock = LockObject{
+        let lock = LockObject {
             id: object::new(ctx),
             created_at: timestamp, 
             deadline: timestamp + dur,
             hashed, 
             refund_adr: refund,
             target_adr: target,
-            initiator: ctx.sender(),
+            initiator: tx_context::sender(ctx),
             coin: amount,
-            secret_length
+            secret_length,
         };
         
-        event::emit(NewLockEvent{
-            lock: sui::object::id(&lock),
+        event::emit(NewLockEvent {
+            lock: object::id(&lock),
             hash: lock.hashed,
-            coin: sui::object::id(&lock.coin),
+            coin: object::id(&lock.coin),
             refund_adr: refund,
             target_adr: target,
             initiator: lock.initiator,
             deadline: lock.deadline,
             duration: dur,
-            secret_length
+            secret_length,
         });
         transfer::share_object(lock);
     }
-    /// `create_lock_object` which defaults to 48 hours
+
+    /// Creates a new hash time lock with a default duration of 48 hours.
+    /// - Parameters:
+    ///   - `clock`: Reference to the Clock object to get the current timestamp.
+    ///   - `hashed`: Hashed value of the secret.
+    ///   - `target`: Address to which the coin will be transferred upon redemption.
+    ///   - `refund`: Address to which the coin will be refunded.
+    ///   - `amount`: The coin being locked.
+    ///   - `secret_length`: Length of the secret in bytes.
+    ///   - `ctx`: Transaction context.
+    /// - Emits:
+    ///   - `NewLockEvent` with details of the created lock.
     public fun create_lock_object_48<T>(
         clock: &Clock,
-        hashed: vector<u8>, target: address, refund: address, amount: Coin<T>,
+        hashed: vector<u8>, 
+        target: address, 
+        refund: address, 
+        amount: Coin<T>,
         secret_length: u8,
         ctx: &mut TxContext
     ) {
         create_lock_object(
             clock, 
-            172800000,
-            hashed, target, refund, amount, secret_length, ctx
-        );
-    }
-    /// `create_lock_object` which defaults to 24 hours; useful for answering to another lock
-    public fun create_lock_object_24<T>(
-        clock: &Clock,
-        hashed: vector<u8>, target: address, refund: address, amount: Coin<T>,
-        secret_length: u8,
-        ctx: &mut TxContext
-    ) {
-        create_lock_object(
-            clock, 
-            86400000,
+            172800000, // 48 hours in milliseconds
             hashed, target, refund, amount, secret_length, ctx
         );
     }
 
-    /// Redeems the lock. Requires only knowledge of the secret (not restricted to a calling address).
+    /// Creates a new hash time lock with a default duration of 24 hours.
+    /// - Parameters:
+    ///   - `clock`: Reference to the Clock object to get the current timestamp.
+    ///   - `hashed`: Hashed value of the secret.
+    ///   - `target`: Address to which the coin will be transferred upon redemption.
+    ///   - `refund`: Address to which the coin will be refunded.
+    ///   - `amount`: The coin being locked.
+    ///   - `secret_length`: Length of the secret in bytes.
+    ///   - `ctx`: Transaction context.
+    /// - Emits:
+    ///   - `NewLockEvent` with details of the created lock.
+    public fun create_lock_object_24<T>(
+        clock: &Clock,
+        hashed: vector<u8>, 
+        target: address, 
+        refund: address, 
+        amount: Coin<T>,
+        secret_length: u8,
+        ctx: &mut TxContext
+    ) {
+        create_lock_object(
+            clock, 
+            86400000, // 24 hours in milliseconds
+            hashed, target, refund, amount, secret_length, ctx
+        );
+    }
+
+    /// Redeems the lock using the correct secret.
+    /// - Parameters:
+    ///   - `lock`: The lock object to be redeemed.
+    ///   - `secret`: The secret used to redeem the lock.
+    ///   - `ctx`: Transaction context.
+    /// - Emits:
+    ///   - `LockClaimedEvent` with details of the redeemed lock.
     public fun redeem<T>(lock: LockObject<T>, secret: vector<u8>, ctx: &mut TxContext) {
-        assert!(lock.secret_length as u64 == secret.length(), ESecretLengthWrong); 
-        assert!(&hash::sha2_256(secret) == &lock.hashed, ESecretPreimageWrong);
+        assert!(lock.secret_length as u64 == secret.length(), ESecretLengthWrong);
+        assert!(hash::sha2_256(secret) == lock.hashed, ESecretPreimageWrong);
         
-        event::emit(LockClaimedEvent{
-            lock: sui::object::id(&lock),
-            secret: secret,
-            claimer: ctx.sender()
+        event::emit(LockClaimedEvent {
+            lock: object::id(&lock),
+            secret,
+            claimer: tx_context::sender(ctx),
         });
-        let LockObject{id, coin, target_adr, ..} = lock;
+        let LockObject { id, coin, target_adr, .. } = lock;
         transfer::public_transfer(coin, target_adr);
         object::delete(id);
     }
 
-    /// Refunds the lock. Only addresses which the lock is aware of can call this.
+    /// Refunds the lock after the deadline has passed.
+    /// - Parameters:
+    ///   - `lock`: The lock object to be refunded.
+    ///   - `clock`: Reference to the Clock object to get the current timestamp.
+    ///   - `ctx`: Transaction context.
+    /// - Emits:
+    ///   - `LockRefundedEvent` with details of the refunded lock.
     public fun refund<T>(lock: LockObject<T>, clock: &Clock, ctx: &mut TxContext) {
         assert!(
-            &ctx.sender() == &lock.refund_adr
-                || &ctx.sender() == &lock.initiator
-                || &ctx.sender() == &lock.target_adr,
+            tx_context::sender(ctx) == lock.refund_adr
+                || tx_context::sender(ctx) == lock.initiator
+                || tx_context::sender(ctx) == lock.target_adr,
             ERefund3rdParty
         );
-        assert!(clock.timestamp_ms() > lock.deadline, ERefundEarly);
+        assert!(clock::timestamp_ms(clock) > lock.deadline, ERefundEarly);
 
-        event::emit(LockRefundedEvent{
-            lock: sui::object::id(&lock),
-            signer_: ctx.sender()
+        event::emit(LockRefundedEvent {
+            lock: object::id(&lock),
+            signer: tx_context::sender(ctx),
         });
-        let LockObject{id, coin, refund_adr, ..} = lock;
+        let LockObject { id, coin, refund_adr, .. } = lock;
         transfer::public_transfer(coin, refund_adr);
         object::delete(id);
     }
